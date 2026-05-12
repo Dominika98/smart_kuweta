@@ -4,6 +4,8 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'firebase_options.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 
 enum VisitType { kupa, siku, nieznany }
 
@@ -59,19 +61,140 @@ class SmartKuweta extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme(
-        brightness: Brightness.light,
-        primary: Color(0xFF2C2C2C),        // ciemna szarość (jak ciemne futro)
-        onPrimary: Colors.white,
-        secondary: Color(0xFF757575),      // średnia szarość
-        onSecondary: Colors.white,
-        surface: Color(0xFFF5F5F5),        // jasna szarość (jak białe futro)
-        onSurface: Color(0xFF2C2C2C),
-        error: Color(0xFFB00020),
-        onError: Colors.white,
-  ),
+          brightness: Brightness.light,
+          primary: Color(0xFF2C2C2C),
+          onPrimary: Colors.white,
+          secondary: Color(0xFF757575),
+          onSecondary: Colors.white,
+          surface: Color(0xFFF5F5F5),
+          onSurface: Color(0xFF2C2C2C),
+          error: Color(0xFFB00020),
+          onError: Colors.white,
+        ),
+        scaffoldBackgroundColor: Colors.white,
         useMaterial3: true,
       ),
-      home: const HomeScreen(),
+      home: StreamBuilder<User?>(
+        stream: FirebaseAuth.instance.authStateChanges(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Scaffold(
+              body: Center(child: CircularProgressIndicator()),
+            );
+          }
+          if (snapshot.hasData) {
+            return const HomeScreen();
+          }
+          return const LoginScreen();
+        },
+      ),
+    );
+  }
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  bool _isLoading = false;
+  String? _error;
+
+  Future<void> _loginWithGoogle() async {
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+    try {
+      final GoogleSignIn googleSignIn = GoogleSignIn(
+        clientId: '143774411675-j7lo8s629dudi4b68teme7to7mrf1ved.apps.googleusercontent.com',
+      );
+      final GoogleSignInAccount? googleUser = await googleSignIn.signIn();
+      if (googleUser == null) {
+        setState(() => _isLoading = false);
+        return;
+      }
+      final GoogleSignInAuthentication googleAuth =
+          await googleUser.authentication;
+      print('accessToken: ${googleAuth.accessToken}');
+      print('idToken: ${googleAuth.idToken}');
+      final credential = GoogleAuthProvider.credential(
+        accessToken: googleAuth.accessToken,
+        idToken: googleAuth.idToken,
+      );
+      final result = await FirebaseAuth.instance.signInWithCredential(credential);
+      print('User: ${result.user?.email}');
+    } on FirebaseAuthException catch (e) {
+      print('FirebaseAuthException: ${e.code} ${e.message}');
+      setState(() => _error = e.message);
+    } catch (e) {
+      print('Error: $e');
+      setState(() => _error = e.toString());
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '🐱 Smart Kuweta',
+                style: TextStyle(
+                  fontSize: 32,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF2C2C2C),
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Zaloguj się aby monitorować Svena',
+                style: TextStyle(
+                  fontSize: 16,
+                  color: Color(0xFF757575),
+                ),
+              ),
+              const SizedBox(height: 48),
+              if (_error != null) ...[
+                Text(
+                  _error!,
+                  style: const TextStyle(color: Colors.red),
+                ),
+                const SizedBox(height: 16),
+              ],
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: _isLoading ? null : _loginWithGoogle,
+                  icon: const Text('G',
+                      style: TextStyle(
+                          fontSize: 18, fontWeight: FontWeight.bold)),
+                  label: _isLoading
+                      ? const CircularProgressIndicator(color: Colors.white)
+                      : const Text('Zaloguj się przez Google',
+                          style: TextStyle(fontSize: 16)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF2C2C2C),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -147,6 +270,15 @@ class DashboardScreen extends StatelessWidget {
           '🐱 Sven – Ostatnie aktywności',
           style: TextStyle(color: Colors.white, fontSize: 18),
         ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout, color: Colors.white),
+            onPressed: () async {
+              await GoogleSignIn().signOut();
+              await FirebaseAuth.instance.signOut();
+            },
+          ),
+        ],
       ),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
