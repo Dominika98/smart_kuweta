@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "143774411675",
+    "project_id": "smart-kuweta",
+    "storage_bucket": "smart-kuweta.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:143774411675:android:4753938f2b77d2fad9cf3e",
+        "android_client_info": {
+          "package_name": "com.example.smart_kuweta"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAUE_ZxkVKiYg2RDpTBydV_XLCmGhdigAE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

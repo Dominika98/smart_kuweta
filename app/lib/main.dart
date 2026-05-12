@@ -1,12 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:table_calendar/table_calendar.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
-enum VisitType { 
-  kupa, 
-  siku, 
-  nieznany
-}
+enum VisitType { kupa, siku, nieznany }
 
 class CatVisit {
   final String id;
@@ -24,40 +23,29 @@ class CatVisit {
     required this.type,
     this.photoUrl,
   });
+
+  factory CatVisit.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+    return CatVisit(
+      id: doc.id,
+      startTime: (data['startTime'] as Timestamp).toDate(),
+      endTime: (data['endTime'] as Timestamp).toDate(),
+      duration: Duration(seconds: data['duration'] as int),
+      type: data['type'] == 'kupa'
+          ? VisitType.kupa
+          : data['type'] == 'siku'
+              ? VisitType.siku
+              : VisitType.nieznany,
+      photoUrl: data['photoUrl'] as String?,
+    );
+  }
 }
 
-final List<CatVisit> mockVisits = [
-  CatVisit(
-    id: '1',
-    startTime: DateTime.now().subtract(const Duration(hours: 2)),
-    endTime: DateTime.now().subtract(const Duration(hours: 2)).add(const Duration(minutes: 3, seconds: 20)),
-    duration: const Duration(minutes: 3, seconds: 20),
-    type: VisitType.kupa,
-  ),
-  CatVisit(
-    id: '2',
-    startTime: DateTime.now().subtract(const Duration(hours: 5)),
-    endTime: DateTime.now().subtract(const Duration(hours: 5)).add(const Duration(minutes: 1, seconds: 10)),
-    duration: const Duration(minutes: 1, seconds: 10),
-    type: VisitType.siku,
-  ),
-  CatVisit(
-    id: '3',
-    startTime: DateTime.now().subtract(const Duration(hours: 8)),
-    endTime: DateTime.now().subtract(const Duration(hours: 8)).add(const Duration(minutes: 2, seconds: 45)),
-    duration: const Duration(minutes: 2, seconds: 45),
-    type: VisitType.siku,
-  ),
-  CatVisit(
-    id: '4',
-    startTime: DateTime.now().subtract(const Duration(days: 1, hours: 1)),
-    endTime: DateTime.now().subtract(const Duration(days: 1, hours: 1)).add(const Duration(minutes: 4, seconds: 5)),
-    duration: const Duration(minutes: 4, seconds: 5),
-    type: VisitType.kupa,
-  ),
-];
-
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
   runApp(const SmartKuweta());
 }
 
@@ -140,7 +128,7 @@ class DashboardScreen extends StatelessWidget {
 
   String _formatDate(DateTime dt) {
     final now = DateTime.now();
-    if (dt.day == now.day) return 'Dzisiaj';
+    if (dt.day == now.day && dt.month == now.month) return 'Dzisiaj';
     if (dt.day == now.day - 1) return 'Wczoraj';
     return '${dt.day}.${dt.month}.${dt.year}';
   }
@@ -160,35 +148,58 @@ class DashboardScreen extends StatelessWidget {
           style: TextStyle(color: Colors.white, fontSize: 18),
         ),
       ),
-      body: ListView.separated(
-        padding: const EdgeInsets.all(16),
-        itemCount: mockVisits.length,
-        separatorBuilder: (_, __) => const Divider(),
-        itemBuilder: (context, index) {
-          final visit = mockVisits[index];
-          final isKupa = visit.type == VisitType.kupa;
-          return ListTile(
-            leading: CircleAvatar(
-              backgroundColor: isKupa
-                  ? const Color(0xFF757575)
-                  : const Color(0xFFB0BEC5),
-              child: Text(
-                isKupa ? '💩' : '💧',
-                style: const TextStyle(fontSize: 20),
-              ),
-            ),
-            title: Text(
-              '${_formatDate(visit.startTime)} o ${_formatTime(visit.startTime)}',
-              style: const TextStyle(fontWeight: FontWeight.bold),
-            ),
-            subtitle: Text('Czas: ${_formatDuration(visit.duration)}'),
-            trailing: const Icon(Icons.chevron_right),
-            onTap: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => VisitDetailScreen(visit: visit),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('visits')
+            .orderBy('startTime', descending: true)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return const Center(child: Text('Błąd pobierania danych'));
+          }
+          final visits = snapshot.data!.docs
+              .map((doc) => CatVisit.fromFirestore(doc))
+              .toList();
+          if (visits.isEmpty) {
+            return const Center(
+              child: Text('Brak wizyt 😴',
+                  style: TextStyle(color: Colors.grey)),
+            );
+          }
+          return ListView.separated(
+            padding: const EdgeInsets.all(16),
+            itemCount: visits.length,
+            separatorBuilder: (_, __) => const Divider(),
+            itemBuilder: (context, index) {
+              final visit = visits[index];
+              final isKupa = visit.type == VisitType.kupa;
+              return ListTile(
+                leading: CircleAvatar(
+                  backgroundColor: isKupa
+                      ? const Color(0xFF757575)
+                      : const Color(0xFFB0BEC5),
+                  child: Text(
+                    isKupa ? '💩' : '💧',
+                    style: const TextStyle(fontSize: 20),
+                  ),
                 ),
+                title: Text(
+                  '${_formatDate(visit.startTime)} o ${_formatTime(visit.startTime)}',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: Text('Czas: ${_formatDuration(visit.duration)}'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => VisitDetailScreen(visit: visit),
+                    ),
+                  );
+                },
               );
             },
           );
@@ -279,9 +290,26 @@ class LogsScreen extends StatefulWidget {
 class _LogsScreenState extends State<LogsScreen> {
   DateTime _focusedDay = DateTime.now();
   DateTime? _selectedDay;
+  List<CatVisit> _allVisits = [];
+
+  @override
+  void initState() {
+    super.initState();
+    FirebaseFirestore.instance
+        .collection('visits')
+        .orderBy('startTime', descending: true)
+        .snapshots()
+        .listen((snapshot) {
+      setState(() {
+        _allVisits = snapshot.docs
+            .map((doc) => CatVisit.fromFirestore(doc))
+            .toList();
+      });
+    });
+  }
 
   List<CatVisit> _getVisitsForDay(DateTime day) {
-    return mockVisits.where((visit) =>
+    return _allVisits.where((visit) =>
         visit.startTime.year == day.year &&
         visit.startTime.month == day.month &&
         visit.startTime.day == day.day).toList();
@@ -289,9 +317,8 @@ class _LogsScreenState extends State<LogsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final selectedVisits = _selectedDay != null
-        ? _getVisitsForDay(_selectedDay!)
-        : [];
+    final selectedVisits =
+        _selectedDay != null ? _getVisitsForDay(_selectedDay!) : [];
 
     return Scaffold(
       backgroundColor: Colors.white,
@@ -391,12 +418,34 @@ class _LogsScreenState extends State<LogsScreen> {
   }
 }
 
-class StatsScreen extends StatelessWidget {
+class StatsScreen extends StatefulWidget {
   const StatsScreen({super.key});
+
+  @override
+  State<StatsScreen> createState() => _StatsScreenState();
+}
+
+class _StatsScreenState extends State<StatsScreen> {
+  List<CatVisit> _visits = [];
+
+  @override
+  void initState() {
+    super.initState();
+    FirebaseFirestore.instance
+        .collection('visits')
+        .snapshots()
+        .listen((snapshot) {
+      setState(() {
+        _visits = snapshot.docs
+            .map((doc) => CatVisit.fromFirestore(doc))
+            .toList();
+      });
+    });
+  }
 
   Map<int, int> _visitsPerHour() {
     final map = <int, int>{};
-    for (final visit in mockVisits) {
+    for (final visit in _visits) {
       final hour = visit.startTime.hour;
       map[hour] = (map[hour] ?? 0) + 1;
     }
@@ -404,14 +453,14 @@ class StatsScreen extends StatelessWidget {
   }
 
   Duration _averageDuration() {
-    if (mockVisits.isEmpty) return Duration.zero;
-    final total = mockVisits.fold<int>(
-        0, (sum, v) => sum + v.duration.inSeconds);
-    return Duration(seconds: total ~/ mockVisits.length);
+    if (_visits.isEmpty) return Duration.zero;
+    final total =
+        _visits.fold<int>(0, (sum, v) => sum + v.duration.inSeconds);
+    return Duration(seconds: total ~/ _visits.length);
   }
 
   int _countType(VisitType type) =>
-      mockVisits.where((v) => v.type == type).length;
+      _visits.where((v) => v.type == type).length;
 
   @override
   Widget build(BuildContext context) {
@@ -432,13 +481,12 @@ class StatsScreen extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Karty podsumowania
             Row(
               children: [
                 Expanded(
                   child: _statCard(
                     '🐱 Wizyty',
-                    '${mockVisits.length}',
+                    '${_visits.length}',
                     'łącznie',
                   ),
                 ),
@@ -473,7 +521,6 @@ class StatsScreen extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 24),
-            // Wykres
             const Text(
               'Aktywność według godziny',
               style: TextStyle(
@@ -570,8 +617,8 @@ class StatsScreen extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(title,
-              style: const TextStyle(
-                  fontSize: 14, color: Color(0xFF757575))),
+              style:
+                  const TextStyle(fontSize: 14, color: Color(0xFF757575))),
           const SizedBox(height: 8),
           Text(value,
               style: const TextStyle(
@@ -579,8 +626,8 @@ class StatsScreen extends StatelessWidget {
                   fontWeight: FontWeight.bold,
                   color: Color(0xFF2C2C2C))),
           Text(subtitle,
-              style: const TextStyle(
-                  fontSize: 12, color: Color(0xFF757575))),
+              style:
+                  const TextStyle(fontSize: 12, color: Color(0xFF757575))),
         ],
       ),
     );
