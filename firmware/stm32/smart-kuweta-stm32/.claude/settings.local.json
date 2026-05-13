@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-Content \"C:\\\\Users\\\\Laptop\\\\Desktop\\\\repos\\\\smart_kuweta\\\\firmware\\\\stm32\\\\smart-kuweta-stm32\\\\CLAUDE.md\")",
+      "Bash(Select-Object -First 45)"
+    ]
+  }
+}
