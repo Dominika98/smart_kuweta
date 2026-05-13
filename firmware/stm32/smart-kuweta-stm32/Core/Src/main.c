@@ -271,6 +271,12 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
+  /* PIR HC-SR501 on PB2 — active-high digital output */
+  GPIO_InitStruct.Pin = PIR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(PIR_GPIO_Port, &GPIO_InitStruct);
+
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -291,8 +297,16 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    BSP_LED_Toggle(LED_BLUE);
-    osDelay(500);
+    if (HAL_GPIO_ReadPin(PIR_GPIO_Port, PIR_Pin) == GPIO_PIN_SET)
+    {
+      BSP_LED_On(LED_BLUE);
+    }
+    else
+    {
+      BSP_LED_Off(LED_BLUE);
+    }
+
+    osDelay(100);
   }
   /* USER CODE END 5 */
 }

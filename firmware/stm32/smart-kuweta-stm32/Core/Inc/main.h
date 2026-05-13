@@ -78,7 +78,8 @@ void Error_Handler(void);
 #define JTDO_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+#define PIR_Pin GPIO_PIN_2
+#define PIR_GPIO_Port GPIOB
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
