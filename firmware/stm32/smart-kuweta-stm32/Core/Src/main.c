@@ -28,12 +28,18 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum {
+    PIR_IDLE,
+    PIR_VALIDATING,
+    PIR_MEASURING,
+} PirState_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define PIR_MIN_PULSES   3U
+#define PIR_TIMEOUT_MS   5000U
+#define PIR_POLL_MS      100U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,7 +58,7 @@ const osThreadAttr_t defaultTask_attributes = {
   .stack_size = 128 * 4
 };
 /* USER CODE BEGIN PV */
-
+volatile uint32_t last_visit_duration_ms = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -294,19 +300,83 @@ static void MX_GPIO_Init(void)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
+  PirState_t state = PIR_IDLE;
+  GPIO_PinState prev_pin = GPIO_PIN_RESET;
+  uint32_t start_tick = 0;
+  uint32_t last_high_tick = 0;
+  uint32_t pulse_count = 0;
+
   for(;;)
   {
-    if (HAL_GPIO_ReadPin(PIR_GPIO_Port, PIR_Pin) == GPIO_PIN_SET)
+    GPIO_PinState pin = HAL_GPIO_ReadPin(PIR_GPIO_Port, PIR_Pin);
+    uint32_t now = osKernelGetTickCount();
+    int rising_edge = (pin == GPIO_PIN_SET) && (prev_pin == GPIO_PIN_RESET);
+
+    switch (state)
     {
-      BSP_LED_On(LED_BLUE);
-    }
-    else
-    {
-      BSP_LED_Off(LED_BLUE);
+      case PIR_IDLE:
+        BSP_LED_Off(LED_BLUE);
+        BSP_LED_Off(LED_GREEN);
+        if (rising_edge)
+        {
+          pulse_count = 1;
+          start_tick = now;
+          last_high_tick = now;
+          state = PIR_VALIDATING;
+        }
+        break;
+
+      case PIR_VALIDATING:
+        if (pin == GPIO_PIN_SET)
+        {
+          BSP_LED_On(LED_BLUE);
+          last_high_tick = now;
+        }
+        else
+        {
+          BSP_LED_Off(LED_BLUE);
+        }
+        if (rising_edge)
+        {
+          pulse_count++;
+          if (pulse_count >= PIR_MIN_PULSES)
+          {
+            state = PIR_MEASURING;
+            BSP_LED_On(LED_GREEN);
+          }
+        }
+        /* No HIGH for 5 s before reaching 3 pulses — cancel */
+        if ((now - last_high_tick) >= PIR_TIMEOUT_MS)
+        {
+          state = PIR_IDLE;
+          pulse_count = 0;
+        }
+        break;
+
+      case PIR_MEASURING:
+        if (pin == GPIO_PIN_SET)
+        {
+          BSP_LED_On(LED_BLUE);
+          last_high_tick = now;
+        }
+        else
+        {
+          BSP_LED_Off(LED_BLUE);
+        }
+        /* 5 s gap with no HIGH — visit is over */
+        if ((now - last_high_tick) >= PIR_TIMEOUT_MS)
+        {
+          uint32_t raw = now - start_tick;
+          last_visit_duration_ms = (raw >= PIR_TIMEOUT_MS) ? (raw - PIR_TIMEOUT_MS) : 0;
+          state = PIR_IDLE;
+          pulse_count = 0;
+          BSP_LED_Off(LED_GREEN);
+        }
+        break;
     }
 
-    osDelay(100);
+    prev_pin = pin;
+    osDelay(PIR_POLL_MS);
   }
   /* USER CODE END 5 */
 }
