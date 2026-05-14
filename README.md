@@ -13,7 +13,7 @@ Designed and built end-to-end as a personal project — from hardware selection 
 │                   Hardware Layer                     │
 │                                                     │
 │  STM32WB55 (FreeRTOS)        ESP32-CAM              │
-│  ├── PIR HC-SR501        ←→  ├── OV2640 Camera      │
+│  ├── PIR HC-SR501            ├── OV2640 Camera      │
 │  ├── GPIO interrupt ISR      ├── WS2812 LED Ring     │
 │  ├── RTC timestamping        └── WiFi → Firebase    │
 │  └── UART → ESP32-CAM                               │
@@ -40,15 +40,15 @@ Designed and built end-to-end as a personal project — from hardware selection 
 
 | Component | Model | Role |
 |---|---|---|
-| MCU + BLE | STM32WB55RG (P-NUCLEO-WB55) | Main controller, FreeRTOS, motion handling |
+| MCU | STM32WB55RG (P-NUCLEO-WB55) | Main controller, FreeRTOS, motion handling |
 | Camera + WiFi | ESP32-CAM (AI-Thinker, OV2640) | Photo capture, cloud upload |
 | Motion Sensor | HC-SR501 PIR | Passive infrared cat detection |
 | Lighting | WS2812 RGB LED Ring (12x) | Addressable illumination, software-controlled brightness |
 | Power | 5V/3A USB-C PSU | Mains powered, stable supply for camera peak current |
 
 ### Hardware Design Decisions
-- **STM32WB55** chosen for its dual-core architecture (Cortex-M4 + M0+) enabling concurrent BLE stack and application logic without interference
 - **PIR over ultrasonic** — HC-SR04 operates at 40kHz, within cat hearing range; PIR is completely silent and passive
+- **UART as inter-module bus** — STM32WB55 signals ESP32-CAM over UART; ESP32-CAM owns all WiFi/cloud communication, keeping the STM32 firmware lean and deterministic
 - **Mains power** — ESP32-CAM draws up to 310mA peak during WiFi transmission; battery supply ruled out for reliability
 
 ---
@@ -77,18 +77,17 @@ Designed and built end-to-end as a personal project — from hardware selection 
 
 - **PIRTask** — handles GPIO interrupt, debounces signal, detects entry/exit events
 - **TimerTask** — measures visit duration using RTC peripheral for accuracy independent of system load
-- **UARTTask** — serializes visit data and signals ESP32-CAM to capture
+- **UARTTask** — serializes visit data and signals ESP32-CAM to capture photo
 
 ### Peripheral Configuration
-- GPIO interrupt on PIR output pin with EXTI line
+- GPIO input on PB2 with pull-down for PIR HC-SR501 (active-high output)
 - RTC for accurate timestamping independent of RTOS tick
 - UART for STM32 ↔ ESP32-CAM communication
-- BLE stack running on M0+ core (STM32WB dual-core architecture)
 
 ### Stack
 - **RTOS**: FreeRTOS (via STM32CubeMX)
 - **HAL**: STM32CubeHAL
-- **IDE**: STM32CubeIDE
+- **Toolchain**: arm-none-eabi-gcc, OpenOCD, CLion
 - **Language**: C
 
 ---
@@ -121,6 +120,7 @@ Cross-platform mobile app targeting **Android and iOS** with a shared codebase, 
 - 📊 **Statistics** — visit frequency, average duration, 24h activity heatmap
 - 🖼️ **Visit Detail** — photo, start/end time, duration, visit type classification
 - 🔔 **Push Notifications** — FCM-delivered alerts on cat activity
+- 🔐 **Authentication** — Google Sign-In via Firebase Auth
 
 ### Architecture
 ```
@@ -137,7 +137,7 @@ Flutter App
 | | |
 |---|---|
 | Framework | Flutter 3.x (Dart) |
-| Backend | Firebase (Firestore, Storage, FCM) |
+| Backend | Firebase (Firestore, Storage, FCM, Auth) |
 | Charts | fl_chart |
 | Calendar | table_calendar |
 | Platforms | Android, iOS, Web |
@@ -167,11 +167,14 @@ smart-kuweta/
 |---|---|
 | Flutter app UI | ✅ Complete |
 | Firestore real-time integration | ✅ Complete |
-| Firebase Storage (photos) | 🔧 In progress |
-| Push notifications (FCM) | 🔧 In progress |
-| STM32 FreeRTOS firmware | 🔧 In development |
+| Google Sign-In authentication | ✅ Complete |
+| STM32 FreeRTOS project setup | ✅ Complete |
+| PIR motion detection (STM32) | ✅ Complete |
+| Visit duration timing (STM32) | 🔧 In development |
+| UART STM32 → ESP32-CAM | 🔧 In development |
 | ESP32-CAM firmware | 🔧 In development |
-| Hardware assembly | 🔧 In progress |
+| Firebase Storage (photos) | 🔧 In development |
+| Push notifications (FCM) | 🔧 In development |
 
 ---
 
@@ -181,9 +184,9 @@ Built end-to-end by a senior embedded developer with full-stack reach — coveri
 
 **Core competencies demonstrated:**
 - FreeRTOS task design, inter-task communication (queues, semaphores)
-- STM32 peripheral configuration (GPIO EXTI, UART, RTC, BLE)
+- STM32 peripheral configuration (GPIO EXTI, UART, RTC)
 - ESP32 WiFi + camera pipeline
-- Firebase real-time backend (Firestore, Storage, FCM)
+- Firebase real-time backend (Firestore, Storage, FCM, Auth)
 - Flutter cross-platform mobile development (Android + iOS + Web)
 
 ---
