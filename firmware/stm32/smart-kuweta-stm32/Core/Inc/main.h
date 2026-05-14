@@ -56,7 +56,7 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-extern volatile uint32_t last_visit_duration_ms;
+
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
