@@ -257,8 +257,7 @@ static esp_err_t firebase_upload_photo(const uint8_t *jpeg_data, size_t jpeg_len
 static time_t firebase_get_server_time(void)
 {
     char url[256];
-    snprintf(url, sizeof(url),
-        "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents?key=%s&pageSize=1",
+    snprintf(url, sizeof(url), "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents?key=%s&pageSize=1",
         FIREBASE_PROJECT, FIREBASE_API_KEY);
 
     http_resp_t resp = { .body = calloc(1, 1), .body_len = 0, .date_header = "" };
@@ -298,15 +297,10 @@ static time_t firebase_get_server_time(void)
  *   photoUrl   – URL zdjęcia w Storage
  *   type       – "unknown" (Flutter uzupełni)
  */
-static esp_err_t firebase_log_visit(const char *visit_id,
-                                     const char *start_time_iso,
-                                     const char *end_time_iso,
-                                     uint32_t    duration_s,
-                                     const char *photo_url)
+static esp_err_t firebase_log_visit(const char *visit_id, const char *start_time_iso, const char *end_time_iso, uint32_t    duration_s, const char *photo_url)
 {
     char url[512];
-    snprintf(url, sizeof(url),
-        "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents/visits/%s?key=%s",
+    snprintf(url, sizeof(url), "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents/visits/%s?key=%s",
         FIREBASE_PROJECT, visit_id, FIREBASE_API_KEY);
 
     char body[1024];
