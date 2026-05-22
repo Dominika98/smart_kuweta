@@ -7,8 +7,11 @@
 #include "esp_camera.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_http_client.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "esp_crt_bundle.h"
 
 static const char *TAG = "smart-kuweta";
 
@@ -16,8 +19,8 @@ static const char *TAG = "smart-kuweta";
 #define WIFI_SSID      "Orange_Swiatlowod_7F70"
 #define WIFI_PASSWORD  "5kZ26fQxJNcfK5JF97"
 
-#define WIFI_CONNECTED_BIT BIT0
-static EventGroupHandle_t s_wifi_event_group;
+#define FIREBASE_API_KEY      "AIzaSyBZ-CpVLxWsf_53Hga1YJ2HDXjWfr7U8OE"
+#define FIREBASE_BUCKET       "smart-kuweta.firebasestorage.app"
 
 #define FLASH_GPIO      GPIO_NUM_4
 
@@ -39,16 +42,17 @@ static EventGroupHandle_t s_wifi_event_group;
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
-/* ── WiFi event handler ──────────────────────────────────────── */
+/* ── WiFi ────────────────────────────────────────────────────── */
+#define WIFI_CONNECTED_BIT BIT0
+static EventGroupHandle_t s_wifi_event_group;
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi disconnected, retrying...");
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, "WiFi connected! IP: " IPSTR,
-                 IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -86,6 +90,9 @@ static esp_err_t camera_init(void)
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << FLASH_GPIO),
         .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
     gpio_set_level(FLASH_GPIO, 0);
@@ -94,6 +101,9 @@ static esp_err_t camera_init(void)
     gpio_config_t pwdn_conf = {
         .pin_bit_mask = (1ULL << GPIO_NUM_32),
         .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&pwdn_conf);
     gpio_set_level(GPIO_NUM_32, 1);
@@ -132,6 +142,45 @@ static esp_err_t camera_init(void)
     return esp_camera_init(&config);
 }
 
+/* ── Firebase Storage upload ─────────────────────────────────── */
+static esp_err_t firebase_upload_photo(const uint8_t *jpeg_data, size_t jpeg_len, const char *visit_id)
+{
+    char url[512];
+    snprintf(url, sizeof(url), "https://firebasestorage.googleapis.com/v0/b/%s/o?uploadType=media&name=visits%%2F%s.jpg&key=%s", 
+            FIREBASE_BUCKET, visit_id, FIREBASE_API_KEY);
+
+    ESP_LOGI(TAG, "Uploading %zu bytes to Firebase Storage...", jpeg_len);
+
+    esp_http_client_config_t cfg = {
+        .url            = url,
+        .method         = HTTP_METHOD_POST,
+        .timeout_ms     = 15000,
+        .buffer_size    = 4096,
+        .crt_bundle_attach = esp_crt_bundle_attach,  /* ← weryfikacja SSL przez bundle */
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "image/jpeg");
+    esp_http_client_set_post_field(client, (const char *)jpeg_data, jpeg_len);
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status    = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP error: %s", esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    if (status == 200) {
+        ESP_LOGI(TAG, "Upload OK! visits/%s.jpg", visit_id);
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG, "Upload failed, HTTP status: %d", status);
+        return ESP_FAIL;
+    }
+}
+
 /* ── app_main ────────────────────────────────────────────────── */
 void app_main(void)
 {
@@ -157,6 +206,7 @@ void app_main(void)
         ESP_LOGE(TAG, "WiFi connection failed!");
         return;
     }
+    ESP_LOGI(TAG, "WiFi OK!");
 
     /* Zrób zdjęcie */
     ESP_LOGI(TAG, "Flash ON – capturing...");
@@ -171,7 +221,13 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "Photo: %zu bytes (%dx%d)", fb->len, fb->width, fb->height);
+
+    /* Upload do Firebase */
+    char visit_id[32];
+    snprintf(visit_id, sizeof(visit_id), "%lld", (long long)(esp_timer_get_time() / 1000));
+
+    firebase_upload_photo(fb->buf, fb->len, visit_id);
     esp_camera_fb_return(fb);
 
-    ESP_LOGI(TAG, "WiFi + Camera OK! Gotowe do Firebase 🚀");
+    ESP_LOGI(TAG, "Done! 🚀");
 }
