@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -21,6 +23,7 @@ static const char *TAG = "smart-kuweta";
 
 #define FIREBASE_API_KEY      "AIzaSyBZ-CpVLxWsf_53Hga1YJ2HDXjWfr7U8OE"
 #define FIREBASE_BUCKET       "smart-kuweta.firebasestorage.app"
+#define FIREBASE_PROJECT      "smart-kuweta"
 
 #define FLASH_GPIO      GPIO_NUM_4
 
@@ -142,14 +145,75 @@ static esp_err_t camera_init(void)
     return esp_camera_init(&config);
 }
 
+/* ── HTTP helper ─────────────────────────────────────────────── */
+typedef struct {
+    char *body;
+    int   body_len;
+    char  date_header[64];  /* nagłówek Date z odpowiedzi serwera */
+} http_resp_t;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    http_resp_t *resp = (http_resp_t *)evt->user_data;
+    if (!resp) return ESP_OK;
+
+    if (evt->event_id == HTTP_EVENT_ON_HEADER) {
+        /* Przechwytuj nagłówek Date – zawiera czas serwera */
+        if (strcasecmp(evt->header_key, "Date") == 0) {
+            strncpy(resp->date_header, evt->header_value,
+                    sizeof(resp->date_header) - 1);
+        }
+    } else if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        int new_len = resp->body_len + evt->data_len;
+        resp->body = realloc(resp->body, new_len + 1);
+        memcpy(resp->body + resp->body_len, evt->data, evt->data_len);
+        resp->body_len = new_len;
+        resp->body[resp->body_len] = '\0';
+    }
+    return ESP_OK;
+}
+
+/* ── Parsowanie nagłówka HTTP Date → time_t ──────────────────── */
+/*
+ * Format RFC 7231: "Thu, 22 May 2026 17:53:40 GMT"
+ * Używamy strptime z newlib który jest dostępny w ESP-IDF.
+ */
+static time_t parse_http_date(const char *date_str)
+{
+    if (!date_str || strlen(date_str) == 0) return 0;
+
+    struct tm tm = {};
+    /* Przykład: "Thu, 22 May 2026 17:53:40 GMT" */
+    char *result = strptime(date_str, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    if (!result) {
+        ESP_LOGW(TAG, "Failed to parse date: %s", date_str);
+        return 0;
+    }
+    return mktime(&tm);  /* UTC epoch seconds */
+}
+
+/* ── Formatowanie time_t → ISO 8601 ─────────────────────────── */
+/*
+ * Firestore timestampValue wymaga formatu ISO 8601:
+ * "2026-05-22T17:53:40Z"
+ */
+static void format_iso8601(time_t t, char *out, size_t out_len)
+{
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(out, out_len, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
 /* ── Firebase Storage upload ─────────────────────────────────── */
-static esp_err_t firebase_upload_photo(const uint8_t *jpeg_data, size_t jpeg_len, const char *visit_id)
+static esp_err_t firebase_upload_photo(const uint8_t *jpeg_data, size_t jpeg_len, const char *visit_id, char *out_url, size_t out_url_len)
 {
     char url[512];
     snprintf(url, sizeof(url), "https://firebasestorage.googleapis.com/v0/b/%s/o?uploadType=media&name=visits%%2F%s.jpg&key=%s", 
             FIREBASE_BUCKET, visit_id, FIREBASE_API_KEY);
 
-    ESP_LOGI(TAG, "Uploading %zu bytes to Firebase Storage...", jpeg_len);
+    ESP_LOGI(TAG, "Uploading photo %zu bytes...", jpeg_len);
+
+    http_resp_t resp = { .body = calloc(1, 1), .body_len = 0 };
 
     esp_http_client_config_t cfg = {
         .url            = url,
@@ -157,6 +221,8 @@ static esp_err_t firebase_upload_photo(const uint8_t *jpeg_data, size_t jpeg_len
         .timeout_ms     = 15000,
         .buffer_size    = 4096,
         .crt_bundle_attach = esp_crt_bundle_attach,  /* ← weryfikacja SSL przez bundle */
+        .event_handler     = http_event_handler,
+        .user_data         = &resp,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -167,18 +233,124 @@ static esp_err_t firebase_upload_photo(const uint8_t *jpeg_data, size_t jpeg_len
     int status    = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP error: %s", esp_err_to_name(err));
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGE(TAG, "Upload failed: err=%s status=%d", esp_err_to_name(err), status);
+        free(resp.body);
         return ESP_FAIL;
     }
 
-    if (status == 200) {
-        ESP_LOGI(TAG, "Upload OK! visits/%s.jpg", visit_id);
-        return ESP_OK;
+    if (out_url && out_url_len > 0) {
+        snprintf(out_url, out_url_len, "https://firebasestorage.googleapis.com/v0/b/%s/o/visits%%2F%s.jpg?alt=media&key=%s",
+            FIREBASE_BUCKET, visit_id, FIREBASE_API_KEY);
+    }
+
+    ESP_LOGI(TAG, "Photo uploaded: visits/%s.jpg", visit_id);
+    free(resp.body);
+    return ESP_OK;
+}
+
+/* ── Firebase – pobierz czas serwera ─────────────────────────── */
+/*
+ * Robimy HEAD request do Firestore — serwer zwraca nagłówek Date
+ * który zawiera aktualny czas UTC. Nie wysyłamy żadnych danych.
+ */
+static time_t firebase_get_server_time(void)
+{
+    char url[256];
+    snprintf(url, sizeof(url),
+        "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents?key=%s&pageSize=1",
+        FIREBASE_PROJECT, FIREBASE_API_KEY);
+
+    http_resp_t resp = { .body = calloc(1, 1), .body_len = 0, .date_header = "" };
+
+    esp_http_client_config_t cfg = {
+        .url               = url,
+        .method            = HTTP_METHOD_GET,
+        .timeout_ms        = 10000,
+        .buffer_size       = 512,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler     = http_event_handler,
+        .user_data         = &resp,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_err_t err = esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+
+    time_t server_time = 0;
+    if (err == ESP_OK && strlen(resp.date_header) > 0) {
+        server_time = parse_http_date(resp.date_header);
+        ESP_LOGI(TAG, "Server time header: %s → epoch: %lld", resp.date_header, (long long)server_time);
     } else {
-        ESP_LOGE(TAG, "Upload failed, HTTP status: %d", status);
+        ESP_LOGW(TAG, "Could not get server time");
+    }
+
+    free(resp.body);
+    return server_time;
+}
+
+/* ── Firestore – zapis wizyty ────────────────────────────────── */
+/*
+ * Zapisuje dokument visits/{visit_id} z polami:
+ *   startTime  – ISO 8601 timestamp
+ *   endTime    – ISO 8601 timestamp
+ *   duration   – liczba sekund (int)
+ *   photoUrl   – URL zdjęcia w Storage
+ *   type       – "unknown" (Flutter uzupełni)
+ */
+static esp_err_t firebase_log_visit(const char *visit_id,
+                                     const char *start_time_iso,
+                                     const char *end_time_iso,
+                                     uint32_t    duration_s,
+                                     const char *photo_url)
+{
+    char url[512];
+    snprintf(url, sizeof(url),
+        "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents/visits/%s?key=%s",
+        FIREBASE_PROJECT, visit_id, FIREBASE_API_KEY);
+
+    char body[1024];
+    snprintf(body, sizeof(body),
+        "{"
+        "\"fields\":{"
+        "\"startTime\":{\"timestampValue\":\"%s\"},"
+        "\"endTime\":{\"timestampValue\":\"%s\"},"
+        "\"duration\":{\"integerValue\":\"%lu\"},"
+        "\"type\":{\"stringValue\":\"unknown\"},"
+        "\"photoUrl\":{\"stringValue\":\"%s\"}"
+        "}"
+        "}",
+        start_time_iso,
+        end_time_iso,
+        (unsigned long)duration_s,
+        photo_url ? photo_url : "");
+
+    ESP_LOGI(TAG, "Logging visit: %s → %s (%lu s)", start_time_iso, end_time_iso, (unsigned long)duration_s);
+
+    esp_http_client_config_t cfg = {
+        .url               = url,
+        .method            = HTTP_METHOD_PATCH,
+        .timeout_ms        = 10000,
+        .buffer_size       = 2048,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, strlen(body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status    = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || (status != 200 && status != 201)) {
+        ESP_LOGE(TAG, "Firestore write failed: err=%s status=%d",
+                 esp_err_to_name(err), status);
         return ESP_FAIL;
     }
+
+    ESP_LOGI(TAG, "Visit logged to Firestore OK!");
+    return ESP_OK;
 }
 
 /* ── app_main ────────────────────────────────────────────────── */
@@ -195,6 +367,7 @@ void app_main(void)
 
     /* Kamera */
     ESP_ERROR_CHECK(camera_init());
+    vTaskDelay(pdMS_TO_TICKS(500));  /* OV3660 czas na pełną inicjalizację */
     ESP_LOGI(TAG, "Camera OK!");
 
     /* WiFi */
@@ -226,8 +399,31 @@ void app_main(void)
     char visit_id[32];
     snprintf(visit_id, sizeof(visit_id), "%lld", (long long)(esp_timer_get_time() / 1000));
 
-    firebase_upload_photo(fb->buf, fb->len, visit_id);
+    /* Upload zdjęcia */
+    char photo_url[512] = "";
+    firebase_upload_photo(fb->buf, fb->len, visit_id, photo_url, sizeof(photo_url));
     esp_camera_fb_return(fb);
+
+    /* Pobierz czas serwera = endTime */
+    uint32_t duration_s = 42; /* docelowo z STM32 UART */
+    time_t end_time = firebase_get_server_time();
+    if (end_time == 0) {
+        ESP_LOGE(TAG, "No server time, skipping Firestore log");
+        return;
+    }
+    time_t start_time = end_time - (time_t)duration_s;
+
+    /* Formatuj do ISO 8601 */
+    char end_time_iso[32];
+    char start_time_iso[32];
+    format_iso8601(end_time,   end_time_iso,   sizeof(end_time_iso));
+    format_iso8601(start_time, start_time_iso, sizeof(start_time_iso));
+
+    ESP_LOGI(TAG, "startTime: %s", start_time_iso);
+    ESP_LOGI(TAG, "endTime:   %s", end_time_iso);
+
+    /* Zapis w Firestore */
+    firebase_log_visit(visit_id, start_time_iso, end_time_iso, duration_s, photo_url);
 
     ESP_LOGI(TAG, "Done! 🚀");
 }
