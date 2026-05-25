@@ -14,6 +14,7 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "esp_crt_bundle.h"
+#include "led_strip.h"
 
 static const char *TAG = "smart-kuweta";
 
@@ -26,6 +27,9 @@ static const char *TAG = "smart-kuweta";
 #define FIREBASE_PROJECT      "smart-kuweta"
 
 #define FLASH_GPIO      GPIO_NUM_4
+
+#define WS2812_GPIO    GPIO_NUM_12
+#define WS2812_COUNT   12
 
 /* AI-Thinker ESP32-CAM pinout */
 #define CAM_PIN_PWDN    32
@@ -48,6 +52,8 @@ static const char *TAG = "smart-kuweta";
 /* ── WiFi ────────────────────────────────────────────────────── */
 #define WIFI_CONNECTED_BIT BIT0
 static EventGroupHandle_t s_wifi_event_group;
+
+static led_strip_handle_t s_led_strip;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -297,7 +303,7 @@ static time_t firebase_get_server_time(void)
  *   photoUrl   – URL zdjęcia w Storage
  *   type       – "unknown" (Flutter uzupełni)
  */
-static esp_err_t firebase_log_visit(const char *visit_id, const char *start_time_iso, const char *end_time_iso, uint32_t    duration_s, const char *photo_url)
+static esp_err_t firebase_log_visit(const char *visit_id, const char *start_time_iso, const char *end_time_iso, uint32_t duration_s, const char *photo_url)
 {
     char url[512];
     snprintf(url, sizeof(url), "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents/visits/%s?key=%s",
@@ -347,6 +353,38 @@ static esp_err_t firebase_log_visit(const char *visit_id, const char *start_time
     return ESP_OK;
 }
 
+/* ── WS2812 LED ring ─────────────────────────────────────────── */
+static void ws2812_init(void)
+{
+    led_strip_config_t strip_cfg = {
+        .strip_gpio_num         = WS2812_GPIO,
+        .max_leds               = WS2812_COUNT,
+        .led_model              = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .flags.invert_out       = false,
+    };
+    led_strip_rmt_config_t rmt_cfg = {
+        .clk_src        = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz  = 10 * 1000 * 1000,
+        .flags.with_dma = false,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &s_led_strip));
+    led_strip_clear(s_led_strip);
+    led_strip_refresh(s_led_strip);
+}
+
+static void ws2812_photo_light(bool on)
+{
+    if (on) {
+        for (int i = 0; i < WS2812_COUNT; i++) {
+            led_strip_set_pixel(s_led_strip, i, 128, 128, 128);
+        }
+    } else {
+        led_strip_clear(s_led_strip);
+    }
+    led_strip_refresh(s_led_strip);
+}
+
 /* ── app_main ────────────────────────────────────────────────── */
 void app_main(void)
 {
@@ -362,6 +400,7 @@ void app_main(void)
     /* Kamera */
     ESP_ERROR_CHECK(camera_init());
     vTaskDelay(pdMS_TO_TICKS(500));  /* OV3660 czas na pełną inicjalizację */
+    ws2812_init();
     ESP_LOGI(TAG, "Camera OK!");
 
     /* WiFi */
@@ -375,12 +414,40 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "WiFi OK!");
 
-    /* Zrób zdjęcie */
-    ESP_LOGI(TAG, "Flash ON – capturing...");
+    /* Pobierz czas serwera natychmiast po wizycie */
+    uint32_t duration_s = 42; /* docelowo z STM32 UART */
+    time_t end_time = 0;
+    for (int i = 0; i < 3 && end_time == 0; i++) {
+        if (i > 0) {
+            ESP_LOGW(TAG, "Retrying server time... (%d/3)", i + 1);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        end_time = firebase_get_server_time();
+    }
+    if (end_time == 0) {
+        ESP_LOGE(TAG, "No server time after 3 retries!");
+        return;
+    }
+    time_t start_time = end_time - (time_t)duration_s;
+
+    /* Czekaj 20s żeby kot wyszedł */
+    ESP_LOGI(TAG, "Waiting 20s for cat to leave...");
+    esp_wifi_set_ps(WIFI_PS_NONE);  /* wyłącz power save podczas oczekiwania */
+    vTaskDelay(pdMS_TO_TICKS(20000));
+
+    /* Ring ON → czekaj 1s → zdjęcie → czekaj 1s → ring OFF */
+    ESP_LOGI(TAG, "Ring ON");
+    ws2812_photo_light(true);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    ESP_LOGI(TAG, "Capturing...");
     gpio_set_level(FLASH_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
     camera_fb_t *fb = esp_camera_fb_get();
     gpio_set_level(FLASH_GPIO, 0);
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ws2812_photo_light(false);
+    ESP_LOGI(TAG, "Ring OFF");
 
     if (!fb) {
         ESP_LOGE(TAG, "Capture failed!");
@@ -398,15 +465,6 @@ void app_main(void)
     firebase_upload_photo(fb->buf, fb->len, visit_id, photo_url, sizeof(photo_url));
     esp_camera_fb_return(fb);
 
-    /* Pobierz czas serwera = endTime */
-    uint32_t duration_s = 42; /* docelowo z STM32 UART */
-    time_t end_time = firebase_get_server_time();
-    if (end_time == 0) {
-        ESP_LOGE(TAG, "No server time, skipping Firestore log");
-        return;
-    }
-    time_t start_time = end_time - (time_t)duration_s;
-
     /* Formatuj do ISO 8601 */
     char end_time_iso[32];
     char start_time_iso[32];
@@ -418,6 +476,8 @@ void app_main(void)
 
     /* Zapis w Firestore */
     firebase_log_visit(visit_id, start_time_iso, end_time_iso, duration_s, photo_url);
+
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  /* przywróć power save */
 
     ESP_LOGI(TAG, "Done! 🚀");
 }
