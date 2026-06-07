@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_camera.h"
 #include "esp_wifi.h"
@@ -13,8 +14,10 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_crt_bundle.h"
 #include "led_strip.h"
+#include "cJSON.h"
 
 static const char *TAG = "smart-kuweta";
 
@@ -25,6 +28,16 @@ static const char *TAG = "smart-kuweta";
 #define FIREBASE_API_KEY      "AIzaSyBZ-CpVLxWsf_53Hga1YJ2HDXjWfr7U8OE"
 #define FIREBASE_BUCKET       "smart-kuweta.firebasestorage.app"
 #define FIREBASE_PROJECT      "smart-kuweta"
+
+/* ── UART1 (STM32 link) ──────────────────────────────────────── */
+#define UART_STM32        UART_NUM_1
+#define UART_STM32_RX     GPIO_NUM_14
+#define UART_STM32_TX     GPIO_NUM_15
+#define UART_BAUD         115200
+#define UART_BUF_SIZE     1024
+#define UART_LINE_MAX     256
+
+static QueueHandle_t s_visit_queue;   /* carries uint32_t duration_s */
 
 #define FLASH_GPIO      GPIO_NUM_4
 
@@ -145,7 +158,7 @@ static esp_err_t camera_init(void)
         .jpeg_quality   = 12,
         .fb_count       = 1,
         .fb_location    = CAMERA_FB_IN_DRAM,
-        .grab_mode      = CAMERA_GRAB_WHEN_EMPTY,
+        .grab_mode      = CAMERA_GRAB_LATEST,
     };
 
     return esp_camera_init(&config);
@@ -213,6 +226,7 @@ static void format_iso8601(time_t t, char *out, size_t out_len)
 /* ── Firebase Storage upload ─────────────────────────────────── */
 static esp_err_t firebase_upload_photo(const uint8_t *jpeg_data, size_t jpeg_len, const char *visit_id, char *out_url, size_t out_url_len)
 {
+    if (out_url && out_url_len > 0) out_url[0] = '\0';
     char url[512];
     snprintf(url, sizeof(url), "https://firebasestorage.googleapis.com/v0/b/%s/o?uploadType=media&name=visits%%2F%s.jpg&key=%s", 
             FIREBASE_BUCKET, visit_id, FIREBASE_API_KEY);
@@ -353,6 +367,74 @@ static esp_err_t firebase_log_visit(const char *visit_id, const char *start_time
     return ESP_OK;
 }
 
+/* ── UART1 – STM32 receiver ──────────────────────────────────── */
+static void uart_init(void)
+{
+    uart_config_t cfg = {
+        .baud_rate  = UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_param_config(UART_STM32, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_STM32, UART_STM32_TX, UART_STM32_RX,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_STM32, UART_BUF_SIZE, 0, 0, NULL, 0));
+    ESP_LOGI(TAG, "UART1 ready (RX=GPIO%d TX=GPIO%d %d baud)",
+             UART_STM32_RX, UART_STM32_TX, UART_BAUD);
+}
+
+/* Reads newline-terminated lines from UART1, parses JSON from STM32.
+ * Expected format: {"duration_s": 42, "event": "visit_end"}\n
+ * On a valid "visit_end" message, pushes duration_s onto s_visit_queue. */
+static void uart_task(void *arg)
+{
+    char line[UART_LINE_MAX];
+    int  pos = 0;
+
+    while (1) {
+        uint8_t byte;
+        int len = uart_read_bytes(UART_STM32, &byte, 1, pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+
+        if (byte == '\n') {
+            line[pos] = '\0';
+            pos = 0;
+
+            cJSON *root = cJSON_Parse(line);
+            if (!root) {
+                ESP_LOGW(TAG, "UART: invalid JSON: %s", line);
+                continue;
+            }
+
+            cJSON *event_item    = cJSON_GetObjectItem(root, "event");
+            cJSON *duration_item = cJSON_GetObjectItem(root, "duration_s");
+
+            if (cJSON_IsString(event_item) &&
+                strcmp(event_item->valuestring, "visit_end") == 0 &&
+                cJSON_IsNumber(duration_item))
+            {
+                uint32_t dur = (uint32_t)duration_item->valuedouble;
+                ESP_LOGI(TAG, "UART: visit_end received, duration=%lu s", (unsigned long)dur);
+                xQueueSend(s_visit_queue, &dur, 0);
+            } else {
+                ESP_LOGW(TAG, "UART: unexpected message: %s", line);
+            }
+
+            cJSON_Delete(root);
+        } else if (byte != '\r') {
+            if (pos < UART_LINE_MAX - 1) {
+                line[pos++] = (char)byte;
+            } else {
+                /* Line too long – discard and reset */
+                ESP_LOGW(TAG, "UART: line overflow, discarding");
+                pos = 0;
+            }
+        }
+    }
+}
+
 /* ── WS2812 LED ring ─────────────────────────────────────────── */
 static void ws2812_init(void)
 {
@@ -403,6 +485,11 @@ void app_main(void)
     ws2812_init();
     ESP_LOGI(TAG, "Camera OK!");
 
+    /* UART1 – czekaj na sygnał z STM32 */
+    s_visit_queue = xQueueCreate(1, sizeof(uint32_t));
+    uart_init();
+    xTaskCreate(uart_task, "uart_task", 4096, NULL, 5, NULL);
+
     /* WiFi */
     wifi_init();
 
@@ -413,71 +500,85 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "WiFi OK!");
+    char photo_url[512];
 
-    /* Pobierz czas serwera natychmiast po wizycie */
-    uint32_t duration_s = 42; /* docelowo z STM32 UART */
-    time_t end_time = 0;
-    for (int i = 0; i < 3 && end_time == 0; i++) {
-        if (i > 0) {
-            ESP_LOGW(TAG, "Retrying server time... (%d/3)", i + 1);
-            vTaskDelay(pdMS_TO_TICKS(2000));
+    while(1)
+    {
+        /* Czekaj na visit_end z STM32 (bez limitu czasu) */
+        uint32_t duration_s = 0;
+        ESP_LOGI(TAG, "Waiting for visit_end from STM32...");
+        xQueueReceive(s_visit_queue, &duration_s, portMAX_DELAY);
+        ESP_LOGI(TAG, "visit_end received: duration=%lu s", (unsigned long)duration_s);
+
+        /* Pobierz czas serwera natychmiast po wizycie */
+        time_t end_time = 0;
+        for (int i = 0; i < 3 && end_time == 0; i++) {
+            if (i > 0) {
+                ESP_LOGW(TAG, "Retrying server time... (%d/3)", i + 1);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+            end_time = firebase_get_server_time();
         }
-        end_time = firebase_get_server_time();
+        if (end_time == 0) {
+            ESP_LOGE(TAG, "No server time after 3 retries!");
+            continue;
+        }
+        time_t start_time = end_time - (time_t)duration_s;
+
+        /* Czekaj 20s żeby kot wyszedł */
+        ESP_LOGI(TAG, "Waiting 20s for cat to leave...");
+        esp_wifi_set_ps(WIFI_PS_NONE);  /* wyłącz power save podczas oczekiwania */
+        vTaskDelay(pdMS_TO_TICKS(20000));
+
+        /* Ring ON → czekaj 1s → zdjęcie → czekaj 1s → ring OFF */
+        ESP_LOGI(TAG, "Ring ON");
+        ws2812_photo_light(true);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        /* Wyczyść stary frame z bufora */
+        camera_fb_t *dummy = esp_camera_fb_get();
+        if (dummy) esp_camera_fb_return(dummy);
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        ESP_LOGI(TAG, "Capturing...");
+        gpio_set_level(FLASH_GPIO, 1);
+        camera_fb_t *fb = esp_camera_fb_get();
+        gpio_set_level(FLASH_GPIO, 0);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ws2812_photo_light(false);
+        ESP_LOGI(TAG, "Ring OFF");
+
+        if (!fb) {
+            ESP_LOGE(TAG, "Capture failed!");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Photo: %zu bytes (%dx%d)", fb->len, fb->width, fb->height);
+
+        /* Upload do Firebase */
+        char visit_id[32];
+        snprintf(visit_id, sizeof(visit_id), "%lld", (long long)(esp_timer_get_time() / 1000));
+
+        /* Upload zdjęcia */
+        memset(photo_url, 0, sizeof(photo_url));
+        firebase_upload_photo(fb->buf, fb->len, visit_id, photo_url, sizeof(photo_url));
+        esp_camera_fb_return(fb);
+
+        /* Formatuj do ISO 8601 */
+        char end_time_iso[32];
+        char start_time_iso[32];
+        format_iso8601(end_time,   end_time_iso,   sizeof(end_time_iso));
+        format_iso8601(start_time, start_time_iso, sizeof(start_time_iso));
+
+        ESP_LOGI(TAG, "startTime: %s", start_time_iso);
+        ESP_LOGI(TAG, "endTime:   %s", end_time_iso);
+
+        /* Zapis w Firestore */
+        firebase_log_visit(visit_id, start_time_iso, end_time_iso, duration_s, photo_url);
+
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  /* przywróć power save */
+
+        ESP_LOGI(TAG, "Done! 🚀");
     }
-    if (end_time == 0) {
-        ESP_LOGE(TAG, "No server time after 3 retries!");
-        return;
-    }
-    time_t start_time = end_time - (time_t)duration_s;
-
-    /* Czekaj 20s żeby kot wyszedł */
-    ESP_LOGI(TAG, "Waiting 20s for cat to leave...");
-    esp_wifi_set_ps(WIFI_PS_NONE);  /* wyłącz power save podczas oczekiwania */
-    vTaskDelay(pdMS_TO_TICKS(20000));
-
-    /* Ring ON → czekaj 1s → zdjęcie → czekaj 1s → ring OFF */
-    ESP_LOGI(TAG, "Ring ON");
-    ws2812_photo_light(true);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    ESP_LOGI(TAG, "Capturing...");
-    gpio_set_level(FLASH_GPIO, 1);
-    camera_fb_t *fb = esp_camera_fb_get();
-    gpio_set_level(FLASH_GPIO, 0);
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ws2812_photo_light(false);
-    ESP_LOGI(TAG, "Ring OFF");
-
-    if (!fb) {
-        ESP_LOGE(TAG, "Capture failed!");
-        return;
-    }
-
-    ESP_LOGI(TAG, "Photo: %zu bytes (%dx%d)", fb->len, fb->width, fb->height);
-
-    /* Upload do Firebase */
-    char visit_id[32];
-    snprintf(visit_id, sizeof(visit_id), "%lld", (long long)(esp_timer_get_time() / 1000));
-
-    /* Upload zdjęcia */
-    char photo_url[512] = "";
-    firebase_upload_photo(fb->buf, fb->len, visit_id, photo_url, sizeof(photo_url));
-    esp_camera_fb_return(fb);
-
-    /* Formatuj do ISO 8601 */
-    char end_time_iso[32];
-    char start_time_iso[32];
-    format_iso8601(end_time,   end_time_iso,   sizeof(end_time_iso));
-    format_iso8601(start_time, start_time_iso, sizeof(start_time_iso));
-
-    ESP_LOGI(TAG, "startTime: %s", start_time_iso);
-    ESP_LOGI(TAG, "endTime:   %s", end_time_iso);
-
-    /* Zapis w Firestore */
-    firebase_log_visit(visit_id, start_time_iso, end_time_iso, duration_s, photo_url);
-
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  /* przywróć power save */
-
-    ESP_LOGI(TAG, "Done! 🚀");
 }
